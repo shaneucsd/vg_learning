@@ -1,4 +1,5 @@
 import sys
+import time
 
 sys.path.append("/Users/apple/Documents/Pycharm/QushiDataPlatform/airflow/dags")
 import os
@@ -10,7 +11,7 @@ from tqdm import tqdm
 from pyunicorn.timeseries import VisibilityGraph
 from ge import Struc2Vec
 from postprocess.datakit.DtLoader import DtLoader
-
+from utils.file_utils import load_object_from_pickle
 
 file_lock = multiprocessing.Lock()
 
@@ -99,12 +100,13 @@ class FeatureData:
                         continue
                     else:
                         self.myset.append((t, n))
-                        self.myset_r.append((self.cld_info[0][t], self.cld_info[0][n]))
+                        self.myset_r.append((self.cld_info[0][t], self.cld_info[1][n]))
         print(
             f"Valid: {len(self.myset)} samples , kept {(len(self.myset) / (T*N)):.2%} <- Timesteps: {T}, Stocks: {N}, Total: {T*N} samples"
         )
-
-    
+        print(
+            f'Example Myset ({self.myset[-1]}): , where represents {self.myset_r[-1]} ', 
+        )
 
     def job_s2v(self, i):
         with file_lock:
@@ -140,17 +142,18 @@ class FeatureData:
             combined_dataset = f.create_dataset(
                 "s2v", shape=(length, G, self.period, self.embed_size), dtype="float32"
             )
-            for i, temp_file in enumerate(tqdm(temp_files, desc="Combining s2v temp files")):
+            for i, temp_file in enumerate(
+                tqdm(temp_files, desc="Combining s2v temp files")
+            ):
                 with h5py.File(os.path.join(TEMP_DIR, temp_file), "r") as temp_f:
                     combined_dataset[:, i, ...] = temp_f["s2v_temp"][...]
                 os.remove(os.path.join(TEMP_DIR, temp_file))
-                
+
     def dump(self):
-        print('Dumping data to hdf5 file...')
-        start = time.time()
+        print("Dumping data to hdf5 file...")
         length = len(self.myset)
         G = len(self.data)
-        
+
         with h5py.File(FILE_PATH, "w") as f:
             myset = f.create_dataset("myset", shape=(len(self.myset), 2), dtype="int32")
             myset_r = f.create_dataset(
@@ -160,46 +163,53 @@ class FeatureData:
                 "raw", shape=(length, G, self.period), dtype="float32"
             )
             y = f.create_dataset("label", shape=(length,), dtype="int32")
-            
+
             # save myset, myset_r, x_raw, y
             for idx, (t, n) in enumerate(self.myset):
                 myset_r[idx, ...] = [t, n]
                 myset[idx, ...] = [t, n]
                 y[idx] = self.labels[t, n]
-                
-                for i in range(G):
-                        x_raw[idx, i, ...] = self.data[i][t - self.period : t, n]
 
-            with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
-                pool.map(self.job_s2v, [i for i in range(G)])
-            
-            self.s2v_stack()
-                
-            end = time.time()
-            print(f"Finished in {end-start:.2f} s")
+                for i in range(G):
+                    x_raw[idx, i, ...] = self.data[i][t - self.period : t, n]
+    
+    def embed_s2v(self):
+        G = len(self.data)
+        print('Init embedding...')
+        with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
+            pool.map(self.job_s2v, [i for i in range(G)])
+        print('Finished embedding')
+        
+        self.s2v_stack()
+        print('Finished Stacking')
+        
 
 if __name__ == "__main__":
     dl = DtLoader("stock")
+    dtStart = dl.close.index.get_loc('2019-12-02')
+    dtEnd =  dl.close.index.get_loc('2023-01-04')
     data = [
-        dl.close.iloc[-100:, :2].values,
-        dl.open.iloc[-100:, :2].values,
-        dl.high.iloc[-100:, :2].values,
-        dl.low.iloc[-100:, :2].values,
-        dl.volume.iloc[-100:, :2].values,
-        dl.amount.iloc[-100:, :2].values,
-        dl.vwap.iloc[-100:, :2].values,
+        dl.close,
+        dl.open,
+        dl.high,
+        dl.low,
+        dl.volume,
+        dl.amount,
+        dl.vwap,
     ]
+    pool = load_object_from_pickle("stock_pool_000300")
+    data = [d.where(pool == 1) for d in data]
+    data = [d.iloc[dtStart:dtEnd, :] for d in data]
+    data = [d.values for d in data]
+    # print(data[0].shape)
+
     cld_info = [
-        [int(dt.strftime("%Y%m%d")) for dt in dl.tradedays],
+        [int(dt.strftime("%Y%m%d")) for dt in dl.tradedays[dtStart:dtEnd]],
         [int(tradeasset) for tradeasset in dl.tradeassets],
     ]
     del dl
 
     feature_data = FeatureData(data=data, cld_info=cld_info, period=20, embed_size=32)
 
-    # time the following
-    import time
-
-    start = time.time()
     feature_data.dump()
-    end = time.time()
+    feature_data.embed_s2v()
